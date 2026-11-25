@@ -1389,11 +1389,12 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
             crate::capture::dump_targets(frame);
         }
     }
+    #[cfg(all(windows, feature = "diagnostics"))]
+    note_planes(planes, plane_parameters);
     #[cfg(windows)]
     if !sent_behind
         && planes > 0
-        // SAFETY: the title passes `planes` plane descriptions.
-        && let Some(plane) = unsafe { plane_parameters.as_ref() }
+        && let Some(plane) = shown_plane(planes, plane_parameters)
         && plane.count > 0
         && !plane.resources.is_null()
         // SAFETY: the plane lists `count` resources.
@@ -1404,8 +1405,13 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
+        // The interface plane laid over the game's (`crate::compose`).
+        let over = second_plane(planes, plane_parameters, resource);
+        let shown = host.present_over(texture, state, over.map(|(_, t, s)| (t, s)), frame);
         crate::resource::host_transition(resource, state);
+        if let Some((second, _, s)) = over {
+            crate::resource::host_transition(second, s);
+        }
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);
         #[cfg(not(feature = "diagnostics"))]
@@ -1415,6 +1421,121 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     let _ = (planes, plane_parameters);
     S_OK
 }
+/// A present's second plane, to be laid over the first (`crate::compose`):
+/// its resource, host texture and host state (its state now noted as the
+/// copy source, as the shown plane's is; given back after the present).
+/// Only with `VICTORY_COMPOSE=1` and no plane chosen with
+/// `VICTORY_PRESENT_PLANE` (off by default: a first run of it lost the
+/// device, cause not found yet).
+#[cfg(windows)]
+fn second_plane<'a>(
+    planes: u32,
+    plane_parameters: *const Plane,
+    first: This,
+) -> Option<(This, &'a windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)> {
+    const STRIDE: usize = 72;
+    const COPY_SOURCE: u32 = 0x800;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_PRESENT_PLANE").is_none()
+            && std::env::var_os("VICTORY_COMPOSE").is_some_and(|v| v == "1")
+    });
+    if !on || planes < 2 || plane_parameters.is_null() {
+        return None;
+    }
+    // SAFETY: the title passes `planes` descriptions of `STRIDE` bytes.
+    let plane = unsafe { plane_parameters.cast::<u8>().add(STRIDE).cast::<Plane>().as_ref() }?;
+    if plane.count == 0 || plane.resources.is_null() {
+        return None;
+    }
+    // SAFETY: the plane lists `count` resources.
+    let resource = unsafe { *plane.resources };
+    if resource == first {
+        return None;
+    }
+    let texture = crate::resource::host_resource(resource)?;
+    let state = crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
+    Some((resource, texture, state))
+}
+
+/// The plane shown: the first, or plane `n` with `VICTORY_PRESENT_PLANE=n`
+/// (a Series S title presents two; past the last, the last).
+/// A description is 72 bytes, as a run of that title showed (see
+/// [`note_planes`]): token, count, resources, source rectangles,
+/// placement, then words not read here.
+/// shortcut: one plane shown, not the planes laid over each other.
+#[cfg(windows)]
+fn shown_plane<'a>(planes: u32, plane_parameters: *const Plane) -> Option<&'a Plane> {
+    const STRIDE: usize = 72;
+    static WHICH: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let which = *WHICH.get_or_init(|| {
+        let n = std::env::var("VICTORY_PRESENT_PLANE")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0);
+        if n != 0 {
+            tracing::info!(plane = n, "presents show this plane (VICTORY_PRESENT_PLANE)");
+        }
+        n
+    });
+    if plane_parameters.is_null() || planes == 0 {
+        return None;
+    }
+    let i = which.min(planes - 1) as usize;
+    // SAFETY: the title passes `planes` descriptions of `STRIDE` bytes.
+    unsafe { plane_parameters.cast::<u8>().add(i * STRIDE).cast::<Plane>().as_ref() }
+}
+
+/// Diagnostics: the planes a present asks for, at presents 1, 2, 4, ...
+/// up to 4096 and whenever their number changes: for each plane (72-byte
+/// descriptions, see [`shown_plane`]) its resources, where they lie in
+/// console memory, their description, and the render target the title
+/// drew in the same memory, if any (a plane shown from a texture other
+/// than the one drawn to would show nothing).
+#[cfg(all(windows, feature = "diagnostics"))]
+fn note_planes(planes: u32, plane_parameters: *const Plane) {
+    const STRIDE: usize = 72;
+    static LAST: AtomicU64 = AtomicU64::new(u64::MAX);
+    let frame = FRAMES.load(Ordering::Relaxed) + 1;
+    let changed = LAST.swap(u64::from(planes), Ordering::Relaxed) != u64::from(planes);
+    if !changed && !(frame.is_power_of_two() && frame <= 4096) {
+        return;
+    }
+    if plane_parameters.is_null() {
+        return;
+    }
+    for i in 0..planes.min(4) as usize {
+        // SAFETY: the title passes `planes` descriptions of `STRIDE` bytes.
+        let Some(plane) =
+            (unsafe { plane_parameters.cast::<u8>().add(i * STRIDE).cast::<Plane>().as_ref() })
+        else {
+            continue;
+        };
+        if plane.resources.is_null() {
+            tracing::warn!(frame, planes, plane = i, count = plane.count, "present plane without resources");
+            continue;
+        }
+        for k in 0..plane.count.min(2) as usize {
+            // SAFETY: the plane lists `count` resources.
+            let resource = unsafe { *plane.resources.add(k) };
+            let memory = crate::resource::texture_memory(resource);
+            let target = crate::resource::target_in_same_memory(resource);
+            tracing::warn!(
+                frame,
+                planes,
+                plane = i,
+                count = plane.count,
+                resource = ?resource,
+                memory = ?memory.map(|m| m.0),
+                desc = ?memory.map(|m| m.1),
+                target_in_same_memory = ?target.map(|t| t.0),
+                target_desc = ?target.map(|t| t.1),
+                "present plane"
+            );
+        }
+    }
+}
+
 /// Diagnostics: logs a presented frame that is black after one that was
 /// not, with what was presented and how many draws ran since.
 #[cfg(all(windows, feature = "diagnostics"))]

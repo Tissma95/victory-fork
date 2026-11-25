@@ -661,6 +661,16 @@ pub(crate) struct PlacedFootprint {
 }
 
 impl PlacedFootprint {
+    /// Subresource index 0, for a copy location of type 0 (which reads
+    /// only the first four bytes).
+    pub(crate) const ZERO: PlacedFootprint =
+        PlacedFootprint { offset: 0, format: 0, width: 0, height: 0, depth: 0, row_pitch: 0 };
+
+    /// Rows of one 2D subresource at the start of a buffer.
+    pub(crate) const fn rows(format: u32, width: u32, height: u32, row_pitch: u32) -> Self {
+        PlacedFootprint { offset: 0, format, width, height, depth: 1, row_pitch }
+    }
+
     /// The bytes it spans in a buffer: every row pitched but the last.
     pub(crate) fn bytes(&self) -> Option<u64> {
         let (element, block) = element(self.format)?;
@@ -1249,6 +1259,21 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
         && target_format(o.desc.format) == o.desc.format
         && element(o.desc.format).is_some_and(|e| e.1 == 1 && Some(e) == element(r.desc.format));
     same.then_some(other)
+}
+
+/// Diagnostics: the render target the title made in the same console
+/// memory as `this`, if any (whatever its description), and that
+/// description.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn target_in_same_memory(this: This) -> Option<(This, ResourceDesc)> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    // Under the table's lock: a texture leaves it before it is freed.
+    let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+    let other = *targets.get(&(r.data() as u64))? as This;
+    Some((other, resource(other).desc))
 }
 
 /// Whether host copies are made on first use. On by default;
@@ -2218,6 +2243,13 @@ impl OnDemand {
             crate::descriptor::host::levels_changed(memory);
         }
     }
+}
+
+/// A texture's width, height and console format, for code outside this
+/// crate (the AMD upscaler stand-in in `victory-hle`); `None` for buffers
+/// and null.
+pub fn texture_shape(this: *const crate::object::Object) -> Option<(u64, u32, u32)> {
+    texture_memory(this).map(|(_, d)| (d.width, d.height, d.format))
 }
 
 /// A texture's console memory and description; `None` for buffers.

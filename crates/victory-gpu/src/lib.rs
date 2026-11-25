@@ -26,6 +26,8 @@ mod renderdoc;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod shot;
 pub mod console;
+#[cfg(windows)]
+mod compose;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 pub mod descriptor;
