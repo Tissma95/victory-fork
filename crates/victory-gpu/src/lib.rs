@@ -35,6 +35,8 @@ mod drvwatch;
 #[cfg(windows)]
 mod fpsbox;
 #[cfg(windows)]
+mod stats;
+#[cfg(windows)]
 mod spread;
 #[cfg(windows)]
 mod draw;
@@ -47,6 +49,8 @@ mod heap_pass;
 pub mod framelog;
 #[cfg(windows)]
 mod compose;
+#[cfg(windows)]
+mod heap_worker;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
