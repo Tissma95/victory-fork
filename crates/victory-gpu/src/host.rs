@@ -41,7 +41,7 @@ static GPU_UPLOAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
-    queue: ID3D12CommandQueue,
+    pub(crate) queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
@@ -2095,7 +2095,11 @@ pub(crate) fn card_compare_groups(pieces: u32) -> u32 {
 /// exact and when a landing falls back to the old fetch.
 fn inflight_fetch() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_CARD_FETCH_INFLIGHT").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        relay()
+            && !crate::shadow::lazy_copyback()
+            && std::env::var_os("VICTORY_CARD_FETCH_INFLIGHT").is_some_and(|v| v == "1")
+    })
 }
 
 /// The bytes of the PC's memory pieces fetched inside flights go to
@@ -3581,37 +3585,64 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
         let mut last: (usize, Option<usize>) = (0, None);
         for list in runs {
             for step in &list.deferred().copies {
-                if let Step::Refresh(shadow, address, len) = step {
-                    let key = Arc::as_ptr(shadow) as usize;
-                    let at = if last.0 == key {
-                        last.1
-                    } else {
-                        let at = *known.entry(key).or_insert_with(|| {
-                            shadow.writes_pending().then(|| {
-                                spans.push((shadow.clone(), usize::MAX, 0));
-                                spans.len() - 1
-                            })
-                        });
-                        last = (key, at);
-                        at
-                    };
-                    if let Some(at) = at {
-                        let s = &mut spans[at];
-                        (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len));
+                match step {
+                    Step::Refresh(shadow, address, len) => {
+                        let key = Arc::as_ptr(shadow) as usize;
+                        let at = if last.0 == key {
+                            last.1
+                        } else {
+                            let at = *known.entry(key).or_insert_with(|| {
+                                shadow.writes_pending().then(|| {
+                                    spans.push((shadow.clone(), usize::MAX, 0));
+                                    spans.len() - 1
+                                })
+                            });
+                            last = (key, at);
+                            at
+                        };
+                        if let Some(at) = at {
+                            let s = &mut spans[at];
+                            (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len));
+                        }
                     }
+                    Step::GpuWrite(shadow, address, len) => {
+                        let key = Arc::as_ptr(shadow) as usize;
+                        let pending = if last.0 == key {
+                            last.1.is_some()
+                        } else {
+                            let at = *known.entry(key).or_insert_with(|| {
+                                shadow.writes_pending().then(|| {
+                                    spans.push((shadow.clone(), usize::MAX, 0));
+                                    spans.len() - 1
+                                })
+                            });
+                            last = (key, at);
+                            at.is_some()
+                        };
+                        if pending && shadow.has_lazy_resync_under_writes(*address, *len) {
+                            return true;
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
     } else {
         for list in runs {
             for step in &list.deferred().copies {
-                if let Step::Refresh(shadow, address, len) = step
-                    && shadow.writes_pending()
-                {
-                    match spans.iter_mut().find(|s| Arc::ptr_eq(&s.0, shadow)) {
-                        Some(s) => (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len)),
-                        None => spans.push((shadow.clone(), *address, *address + *len)),
+                match step {
+                    Step::Refresh(shadow, address, len) if shadow.writes_pending() => {
+                        match spans.iter_mut().find(|s| Arc::ptr_eq(&s.0, shadow)) {
+                            Some(s) => (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len)),
+                            None => spans.push((shadow.clone(), *address, *address + *len)),
+                        }
                     }
+                    Step::GpuWrite(shadow, address, len)
+                        if shadow.writes_pending() && shadow.has_lazy_resync_under_writes(*address, *len) =>
+                    {
+                        return true;
+                    }
+                    _ => {}
                 }
             }
         }
@@ -3663,6 +3694,7 @@ pub(crate) fn late_signal(fence: usize, value: u64) -> bool {
 /// width), they are settled and memory is asked again.
 pub(crate) fn late_met(wait: &crate::list::ValueWait) -> bool {
     let (address, bytes) = wait.place();
+    crate::shadow::lazy_pin_range(address, bytes);
     {
         let line = line();
         if line.line.is_empty() && line.in_hand.is_empty() {
@@ -3701,6 +3733,7 @@ pub(crate) fn late_met(wait: &crate::list::ValueWait) -> bool {
 /// False says nothing about what else the flights may write there.
 pub(crate) fn late_met_known(wait: &crate::list::ValueWait) -> bool {
     let (address, bytes) = wait.place();
+    crate::shadow::lazy_pin_range(address, bytes);
     let line = line();
     let writes = line.in_hand.iter().map(|(at, what, n)| (at, what, n)).chain(line.line.iter().filter_map(|item| match item {
         Late::Write(at, what, n) => Some((at, what, n)),
@@ -5166,6 +5199,8 @@ impl Host {
             // plans have run, and their dwords are given to no other plan
             // before these are done with (`card_done`).
             let differs = unsafe { std::slice::from_raw_parts(differs as *const u32, dwords) };
+            let lazy = crate::shadow::lazy_copyback();
+            let max_sent_as = plans.iter().map(|p| p.1.sent_as).max().unwrap_or(0);
             let mut seen = std::collections::HashSet::new();
             for &(number, plan) in plans {
                 let mut flags: Vec<(usize, u32, bool)> = plan
@@ -5199,6 +5234,9 @@ impl Host {
                             && !crate::census::skip_back(r.declared, (hi - lo) as u64)
                             && seen.insert((copy, lo, hi))
                         {
+                            if lazy && r.shadow.try_defer_piece_relay(lo, hi, max_sent_as) {
+                                continue;
+                            }
                             pieces.push((r.shadow.clone(), lo, hi, total));
                             total += (hi - lo) as u64;
                         }
@@ -5651,6 +5689,7 @@ impl Host {
         let differs = unsafe { std::slice::from_raw_parts(work.differs.1 as *const u32, (work.differs.2 / 4) as usize) };
         // The pieces to fetch: the range, the offsets in its copy, and
         // where the bytes come down.
+        let lazy = crate::shadow::lazy_copyback();
         let mut pieces: Vec<(usize, usize, usize, u64)> = Vec::new();
         let mut total = 0u64;
         for (i, r) in plan.ranges.iter().enumerate() {
@@ -5663,6 +5702,9 @@ impl Host {
                     && !crate::census::skip_back(r.declared, (hi - lo) as u64)
                     && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi))
                 {
+                    if lazy && r.shadow.try_defer_piece(lo, hi) {
+                        continue;
+                    }
                     pieces.push((i, lo, hi, total));
                     total += (hi - lo) as u64;
                 }
@@ -7598,6 +7640,7 @@ impl HostList {
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
+        crate::shadow::lazy_pin_range(dst as usize, bytes);
         self.deferred().writes.push((dst as usize, what, bytes));
     }
 
@@ -8345,6 +8388,10 @@ fn fills_plain() -> bool {
 /// at `dst`. In place if it is short and [`fills_plain`] says so, else (and
 /// if a source page was not there) as every copy ([`copy_mapped`]).
 fn copy_fill(dst: *mut u8, src: *const u8, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let _lazy_src = crate::shadow::lazy_flush_and_hold(src as usize, len);
     #[cfg(feature = "diagnostics")]
     let timing_only = crate::copystat::mode() != 0;
     #[cfg(not(feature = "diagnostics"))]
@@ -8385,6 +8432,12 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     if len == 0 {
         return;
     }
+    // Materialize any lazy GPU-resident `PAGE_NOACCESS` pages and hold a scoped
+    // non-arming range barrier across `ReadProcessMemory` / `plaincopy` /
+    // `read_sparse` so concurrent relay `try_defer_piece_relay` cannot re-arm
+    // `PAGE_NOACCESS` mid-copy.
+    let _lazy_src = crate::shadow::lazy_flush_and_hold(src as usize, len);
+    let _lazy_dst = title_dst.then(|| crate::shadow::lazy_flush_and_hold(dst as usize, len));
     #[cfg(feature = "diagnostics")]
     {
         crate::backreads::touched(src as usize, len, false);
@@ -8493,6 +8546,7 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
 /// Reads title memory at `src` into `dst`; false if a page of it is not
 /// readable.
 pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
+    let _lazy = crate::shadow::lazy_flush_and_hold(src as usize, dst.len());
     #[cfg(feature = "diagnostics")]
     crate::backreads::touched(src as usize, dst.len(), false);
     // In place first, if asked for (`crate::plaincopy`): the destination is
@@ -8539,6 +8593,7 @@ fn direct_writes() -> bool {
 /// Copies host memory into title memory after a submission (what shaders
 /// wrote), leaving pages that are not mapped alone.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
+    let _lazy = crate::shadow::lazy_flush_and_hold(dst as usize, len);
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     #[cfg(feature = "diagnostics")]
