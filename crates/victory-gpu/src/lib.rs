@@ -48,6 +48,8 @@ mod heap_pass;
 #[cfg(windows)]
 pub mod framelog;
 #[cfg(windows)]
+mod ambient;
+#[cfg(windows)]
 mod compose;
 #[cfg(windows)]
 mod heap_worker;
